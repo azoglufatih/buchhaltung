@@ -12,6 +12,7 @@ const OLLAMA_MODEL = process.env.OLLAMA_INVOICE_MODEL ?? "qwen3-vl:8b-instruct";
 const MAX_PAGES = 8;
 
 export type VisionInvoiceLineItem = {
+  name: string;
   description: string;
   asin?: string;
   grossCents: number;
@@ -24,7 +25,7 @@ export type VisionInvoice = {
   invoiceId: string | null;
   invoiceDate: Date;
   vendor: string;
-  service: string;
+  name: string;
   description: string;
   vatRate: number;
   grossCents: number;
@@ -41,7 +42,7 @@ const invoiceSchema = {
     invoiceId: { type: ["string", "null"] },
     invoiceDate: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
     vendor: { type: "string" },
-    service: { type: "string" },
+    name: { type: "string" },
     description: { type: "string" },
     vatRate: { type: "number", minimum: 0, maximum: 1 },
     grossCents: { type: "integer", minimum: 0 },
@@ -54,6 +55,7 @@ const invoiceSchema = {
         type: "object",
         additionalProperties: false,
         properties: {
+          name: { type: "string" },
           description: { type: "string" },
           asin: { type: ["string", "null"] },
           grossCents: { type: "integer", minimum: 0 },
@@ -61,7 +63,7 @@ const invoiceSchema = {
           vatRate: { type: "number", minimum: 0, maximum: 1 },
           category: { type: "string" }
         },
-        required: ["description", "asin", "grossCents", "netCents", "vatRate", "category"]
+        required: ["name", "description", "asin", "grossCents", "netCents", "vatRate", "category"]
       }
     },
     confidence: { type: "number", minimum: 0, maximum: 1 },
@@ -71,7 +73,7 @@ const invoiceSchema = {
     "invoiceId",
     "invoiceDate",
     "vendor",
-    "service",
+    "name",
     "description",
     "vatRate",
     "grossCents",
@@ -95,13 +97,14 @@ Rules:
 - vatRate must be a decimal fraction. Example: 20% is 0.20 and 0% is 0.
 - grossCents and netCents are the final invoice totals, not subtotals or balances from another period.
 - classification is monthly only when the invoice clearly represents a recurring monthly subscription or monthly billing period. Use oneTime for a clearly non-recurring purchase and uncertain otherwise.
-- service is the purchased product, plan, subscription, or primary service; vendor is the issuing company.
+- name is a short semantic title generated from the invoice contents for the table, ideally 2-6 words (for example "ChatGPT Plus", "A1 Business Internet", or "Philips Airfryer"). Use the purchased product, plan, subscription, or primary service. Never use the PDF filename, document filename, invoice number, or generic labels such as "Rechnung" as name.
+- description is a separate, concise German explanation of what was billed. Include useful details visible on the invoice, such as plan/tier, billing period, quantity, scope, model, or purpose. Never copy name or vendor as the entire description.
 - category should be a short German accounting category, preferably one of: AI Tools, Software, Marketing, Kommunikation, Internet, Infrastruktur, Mobilitaet, Transport, Finanzen, Designer, Animation, Sonstiges.
 - Include actual purchasable line items only. Exclude totals, VAT rows, shipping summaries, payment details, and addresses. Use an empty array if reliable line items cannot be separated.
 - confidence reflects confidence in the invoice number, date, vendor, and final totals together.
 - Add a warning for unreadable, missing, conflicting, or mathematically inconsistent information.
-- Use exactly these top-level property names: invoiceId, invoiceDate, vendor, service, description, vatRate, grossCents, netCents, category, classification, lineItems, confidence, warnings.
-- Every line item must use exactly: description, asin, grossCents, netCents, vatRate, category. Set asin to null when absent.
+- Use exactly these top-level property names: invoiceId, invoiceDate, vendor, name, description, vatRate, grossCents, netCents, category, classification, lineItems, confidence, warnings.
+- Every line item must use exactly: name, description, asin, grossCents, netCents, vatRate, category. name is the short product name; description contains additional details and must not merely repeat name. Set asin to null when absent.
 - Do not emit analysis, markdown, XML tags, alternative property names, quantity, or unitPriceCents.
 
 /no_think`;
@@ -415,8 +418,8 @@ function validateInvoice(value: unknown): VisionInvoice {
   const invoiceId = optionalString(rawInvoiceId) || null;
   const invoiceDate = parseInvoiceDate(requiredString(value.invoiceDate, "Rechnungsdatum"));
   const vendor = requiredString(value.vendor, "Anbieter");
-  const service = optionalString(value.service) || optionalString(value.description) || vendor;
-  const description = optionalString(value.description) || service;
+  const name = requiredString(value.name, "Name");
+  const description = requiredString(value.description, "Beschreibung");
   const grossCents = requiredCents(value.grossCents, "Bruttobetrag");
   const netCents = requiredCents(value.netCents, "Nettobetrag");
   const vatRate = requiredRate(value.vatRate, "USt-Satz");
@@ -439,7 +442,7 @@ function validateInvoice(value: unknown): VisionInvoice {
     invoiceId,
     invoiceDate,
     vendor,
-    service,
+    name,
     description,
     vatRate,
     grossCents,
@@ -469,6 +472,7 @@ function parseLineItems(
     }
 
     try {
+      const name = optionalString(entry.name) || requiredString(entry.description, "Positionsname");
       const description = requiredString(entry.description, "Positionsbeschreibung");
       const isOnlyLineItem = value.length === 1;
       const grossCents = entry.grossCents === undefined && isOnlyLineItem
@@ -479,6 +483,7 @@ function parseLineItems(
       }
 
       return [{
+        name,
         description,
         ...(optionalString(entry.asin) ? { asin: optionalString(entry.asin) } : {}),
         grossCents,

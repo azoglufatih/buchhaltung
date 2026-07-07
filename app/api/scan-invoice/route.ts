@@ -20,6 +20,7 @@ type InvoiceClassification = "monthly" | "oneTime" | "uncertain";
 type SplitMode = "combined" | "separate";
 
 type InvoiceLineItem = {
+  name?: string;
   description: string;
   asin?: string;
   grossCents: number;
@@ -44,24 +45,154 @@ type ParsedInvoice = {
   lineItems: InvoiceLineItem[];
 };
 
+type ScanInvoiceDraft = {
+  invoiceId: string | null;
+  invoiceDate: string;
+  vendor: string;
+  service: string;
+  description: string;
+  category: string;
+  grossCents: number;
+  netCents: number;
+  vatRate: number;
+  classification: InvoiceClassification;
+  lineItems: InvoiceLineItem[];
+};
+
+type ProcessedScanResult =
+  | { status: "attached" | "created"; row: ExpenseRow }
+  | { status: "createdMany"; rows: ExpenseRow[] }
+  | { status: "duplicate"; row: ExpenseRow; message: string };
+
+type PendingConfirmationResult = {
+  status: "needsConfirmation";
+  draft: ScanInvoiceDraft;
+  analysis: string;
+  clientFileId: string | null;
+};
+
+type ScanInvoiceResult = ProcessedScanResult | PendingConfirmationResult;
+
 const knownVatRates = [0.2, 0.13, 0.1, 0];
 const execFileAsync = promisify(execFile);
 
 export async function POST(request: Request) {
   const formData = await request.formData();
-  const file = formData.get("file");
+  const files = formData.getAll("file").filter((entry): entry is File => entry instanceof File);
+  const clientFileIds = formData
+    .getAll("clientFileId")
+    .map((entry) => (typeof entry === "string" ? entry : null));
   const classificationOverride = parseClassificationOverride(formData.get("classificationOverride"));
   const splitMode = parseSplitMode(formData.get("splitMode"));
+  const serializedAnalysis = formData.get("analysis");
 
-  if (!(file instanceof File)) {
+  if (files.length === 0) {
     return NextResponse.json({ message: "Keine PDF-Rechnung gefunden." }, { status: 400 });
   }
 
-  if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
-    return NextResponse.json({ message: "Nur PDF-Rechnungen sind erlaubt." }, { status: 415 });
+  const preParsedInvoice = parseSerializedInvoice(serializedAnalysis);
+  if (serializedAnalysis !== null && !preParsedInvoice) {
+    return NextResponse.json({ message: "Die vorbereiteten Rechnungsdaten sind ungueltig." }, { status: 400 });
   }
 
   const payload = await readExpenses();
+  try {
+    if (files.length === 1) {
+      const result = await processInvoiceFile({
+        payload,
+        file: files[0],
+        clientFileId: clientFileIds[0] ?? null,
+        classificationOverride,
+        splitMode,
+        preParsedInvoice
+      });
+
+      if (result.status === "needsConfirmation") {
+        return NextResponse.json({
+          status: "needsConfirmation",
+          draft: result.draft,
+          analysis: result.analysis,
+          clientFileId: result.clientFileId
+        });
+      }
+
+      return NextResponse.json(result);
+    }
+
+    const results: Array<{ fileName: string; clientFileId: string | null; result: ProcessedScanResult }> = [];
+    const pending: Array<{
+      fileName: string;
+      clientFileId: string | null;
+      draft: ScanInvoiceDraft;
+      analysis: string;
+    }> = [];
+
+    for (const [index, file] of files.entries()) {
+      const result = await processInvoiceFile({
+        payload,
+        file,
+        clientFileId: clientFileIds[index] ?? null,
+        classificationOverride,
+        splitMode,
+        preParsedInvoice: null
+      });
+
+      if (result.status === "needsConfirmation") {
+        pending.push({
+          fileName: file.name,
+          clientFileId: result.clientFileId,
+          draft: result.draft,
+          analysis: result.analysis
+        });
+        continue;
+      }
+
+      results.push({
+        fileName: file.name,
+        clientFileId: clientFileIds[index] ?? null,
+        result
+      });
+    }
+
+    if (pending.length > 0) {
+      return NextResponse.json({
+        status: "needsConfirmationMany",
+        results,
+        pending
+      });
+    }
+
+    return NextResponse.json({
+      status: "batchCompleted",
+      results
+    });
+  } catch (error) {
+    if (error instanceof InvoiceVisionError) {
+      return NextResponse.json({ message: error.message }, { status: error.status });
+    }
+    throw error;
+  }
+}
+
+async function processInvoiceFile({
+  payload,
+  file,
+  clientFileId,
+  classificationOverride,
+  splitMode,
+  preParsedInvoice
+}: {
+  payload: Awaited<ReturnType<typeof readExpenses>>;
+  file: File;
+  clientFileId: string | null;
+  classificationOverride: ClassificationOverride | null;
+  splitMode: SplitMode | null;
+  preParsedInvoice: ParsedInvoice | null;
+}): Promise<ScanInvoiceResult> {
+  if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+    throw new InvoiceVisionError("Nur PDF-Rechnungen sind erlaubt.", 415);
+  }
+
   const buffer = Buffer.from(await file.arrayBuffer());
   const originalName = sanitizeFilename(file.name);
   const fileHash = crypto.createHash("sha256").update(buffer).digest("hex");
@@ -71,41 +202,47 @@ export async function POST(request: Request) {
     source: "scanner",
     scanId,
     message: "Rechnungsscan gestartet.",
-    details: { filename: originalName, bytes: buffer.length }
+    details: { filename: originalName, bytes: buffer.length, reusedAnalysis: Boolean(preParsedInvoice) }
   });
-  let visionInvoice;
-  try {
-    visionInvoice = await analyzeInvoiceWithLocalVision(buffer, originalName, scanId);
-  } catch (error) {
-    await recordActivity({
-      level: "error",
-      source: "scanner",
-      scanId,
-      message: "Rechnungsscan fehlgeschlagen.",
-      details: { error: error instanceof Error ? error.message : "Unbekannter Fehler" }
-    });
-    if (error instanceof InvoiceVisionError) {
-      return NextResponse.json({ message: error.message }, { status: error.status });
+
+  let parsedInvoice = preParsedInvoice;
+
+  if (!parsedInvoice) {
+    let visionInvoice;
+    try {
+      visionInvoice = await analyzeInvoiceWithLocalVision(buffer, originalName, scanId);
+    } catch (error) {
+      await recordActivity({
+        level: "error",
+        source: "scanner",
+        scanId,
+        message: "Rechnungsscan fehlgeschlagen.",
+        details: { error: error instanceof Error ? error.message : "Unbekannter Fehler" }
+      });
+      if (error instanceof InvoiceVisionError) {
+        throw error;
+      }
+      throw error;
     }
-    throw error;
+
+    parsedInvoice = {
+      ...visionInvoice,
+      service: visionInvoice.name,
+      subscriptionKey: normalizeSubscriptionKey(`${visionInvoice.vendor} ${visionInvoice.name}`),
+      serviceKey: normalizeSubscriptionKey(visionInvoice.name)
+    };
   }
 
-  const classification = classificationOverride
-    ? classificationOverride === "monthly"
-      ? "monthly"
-      : "oneTime"
-    : visionInvoice.classification;
-  const parsedInvoice: ParsedInvoice = {
-    ...visionInvoice,
-    classification,
-    subscriptionKey: normalizeSubscriptionKey(`${visionInvoice.vendor} ${visionInvoice.service}`),
-    serviceKey: normalizeSubscriptionKey(visionInvoice.service)
+  parsedInvoice = {
+    ...parsedInvoice,
+    classification: classificationOverride
+      ? classificationOverride === "monthly"
+        ? "monthly"
+        : "oneTime"
+      : parsedInvoice.classification
   };
-  const duplicateRow = findDuplicateInvoiceRow(
-    payload.rows,
-    parsedInvoice.invoiceId,
-    fileHash
-  );
+
+  const duplicateRow = findDuplicateInvoiceRow(payload.rows, parsedInvoice.invoiceId, fileHash);
 
   if (duplicateRow) {
     await recordActivity({
@@ -115,15 +252,14 @@ export async function POST(request: Request) {
       message: "Rechnung wurde als Duplikat erkannt.",
       details: { rowId: duplicateRow.id, description: duplicateRow.description }
     });
-    return NextResponse.json({
+    return {
       status: "duplicate",
       row: duplicateRow,
       message: "Diese Rechnung ist bereits bei dieser Position hinterlegt."
-    });
+    };
   }
 
   const existingRow = findMatchingSubscriptionRow(payload.rows, parsedInvoice);
-
   const shouldSuggestLineItemSplit =
     !existingRow && parsedInvoice.lineItems.length > 1 && splitMode === null;
 
@@ -138,10 +274,12 @@ export async function POST(request: Request) {
         suggestedLineItems: parsedInvoice.lineItems.length
       }
     });
-    return NextResponse.json({
+    return {
       status: "needsConfirmation",
-      draft: buildInvoiceDraft(parsedInvoice)
-    });
+      draft: buildInvoiceDraft(parsedInvoice),
+      analysis: serializeParsedInvoice(parsedInvoice),
+      clientFileId
+    };
   }
 
   if (!existingRow && splitMode === "separate" && parsedInvoice.lineItems.length > 1) {
@@ -170,6 +308,7 @@ export async function POST(request: Request) {
     }
 
     const savedPayload = await writeExpenses(payload);
+    payload.rows = savedPayload.rows;
     const savedRows = createdRows.map(
       (createdRow) => savedPayload.rows.find((row) => row.id === createdRow.id) ?? createdRow
     );
@@ -182,10 +321,10 @@ export async function POST(request: Request) {
       details: { rows: savedRows.length, invoiceId: parsedInvoice.invoiceId }
     });
 
-    return NextResponse.json({
+    return {
       status: "createdMany",
       rows: savedRows
-    });
+    };
   }
 
   const targetRow = existingRow ?? buildRowFromInvoice(parsedInvoice);
@@ -207,6 +346,7 @@ export async function POST(request: Request) {
   targetRow.invoiceFile = appendAttachment(targetRow.invoiceFile, attachment);
 
   const savedPayload = await writeExpenses(payload);
+  payload.rows = savedPayload.rows;
   const savedRow = savedPayload.rows.find((row) => row.id === targetRow.id) ?? targetRow;
 
   await recordActivity({
@@ -224,10 +364,10 @@ export async function POST(request: Request) {
     }
   });
 
-  return NextResponse.json({
+  return {
     status: existingRow ? "attached" : "created",
     row: savedRow
-  });
+  };
 }
 
 function parseClassificationOverride(value: FormDataEntryValue | null): ClassificationOverride | null {
@@ -290,7 +430,7 @@ function buildRowFromInvoice(invoice: ParsedInvoice): ExpenseRow {
     interval,
     category: invoice.category,
     name,
-    description: getDistinctDescription(name, invoice.description),
+    description: getDistinctDescription(name, invoice.description, invoice.vendor),
     invoiceNumber: invoice.invoiceId || "",
     startMonth: invoice.invoiceDate.getMonth() + 1,
     paymentsPerYear: isMonthly ? 12 : 1,
@@ -309,8 +449,11 @@ function buildRowFromInvoiceLineItem(
   lineItem: InvoiceLineItem,
   index: number
 ): ExpenseRow {
-  const name = lineItem.description;
-  const description = lineItem.asin ? `ASIN ${lineItem.asin}` : "";
+  const name = lineItem.name || lineItem.description;
+  const distinctDescription = getDistinctDescription(name, lineItem.description, invoice.vendor);
+  const description = lineItem.asin && !distinctDescription.includes(lineItem.asin)
+    ? `${distinctDescription} · ASIN ${lineItem.asin}`
+    : distinctDescription;
 
   return {
     id: `exp-invoice-${Date.now()}-${index + 1}`,
@@ -333,14 +476,21 @@ function buildRowFromInvoiceLineItem(
   };
 }
 
-function getDistinctDescription(name: string, description: string) {
+function getDistinctDescription(name: string, description: string, vendor: string) {
   const trimmedDescription = description.trim();
 
-  if (normalizeSubscriptionKey(name) === normalizeSubscriptionKey(trimmedDescription)) {
-    return "";
+  if (
+    trimmedDescription &&
+    normalizeSubscriptionKey(name) !== normalizeSubscriptionKey(trimmedDescription)
+  ) {
+    return trimmedDescription;
   }
 
-  return trimmedDescription;
+  if (normalizeSubscriptionKey(name) !== normalizeSubscriptionKey(vendor)) {
+    return `Anbieter: ${vendor}`;
+  }
+
+  return "Details laut Rechnung";
 }
 
 function buildInvoiceDraft(invoice: ParsedInvoice) {
@@ -354,8 +504,79 @@ function buildInvoiceDraft(invoice: ParsedInvoice) {
     grossCents: invoice.grossCents,
     netCents: invoice.netCents,
     vatRate: invoice.vatRate,
+    classification: invoice.classification,
     lineItems: invoice.lineItems
   };
+}
+
+function serializeParsedInvoice(invoice: ParsedInvoice) {
+  return JSON.stringify({
+    ...invoice,
+    invoiceDate: invoice.invoiceDate.toISOString()
+  });
+}
+
+function parseSerializedInvoice(value: FormDataEntryValue | null) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(value) as Partial<ScanInvoiceDraft & {
+      subscriptionKey: string;
+      serviceKey: string;
+    }>;
+
+    if (
+      typeof parsed.vendor !== "string" ||
+      typeof parsed.service !== "string" ||
+      typeof parsed.description !== "string" ||
+      typeof parsed.category !== "string" ||
+      typeof parsed.grossCents !== "number" ||
+      typeof parsed.netCents !== "number" ||
+      typeof parsed.vatRate !== "number" ||
+      typeof parsed.invoiceDate !== "string" ||
+      !Array.isArray(parsed.lineItems)
+    ) {
+      return null;
+    }
+
+    const invoiceDate = new Date(parsed.invoiceDate);
+    if (Number.isNaN(invoiceDate.getTime())) {
+      return null;
+    }
+
+    const classification =
+      parsed.classification === "monthly" ||
+      parsed.classification === "oneTime" ||
+      parsed.classification === "uncertain"
+        ? parsed.classification
+        : "uncertain";
+
+    return {
+      invoiceId: typeof parsed.invoiceId === "string" ? parsed.invoiceId : null,
+      invoiceDate,
+      vendor: parsed.vendor,
+      service: parsed.service,
+      description: parsed.description,
+      subscriptionKey:
+        typeof parsed.subscriptionKey === "string"
+          ? parsed.subscriptionKey
+          : normalizeSubscriptionKey(`${parsed.vendor} ${parsed.service}`),
+      serviceKey:
+        typeof parsed.serviceKey === "string"
+          ? parsed.serviceKey
+          : normalizeSubscriptionKey(parsed.service),
+      vatRate: parsed.vatRate,
+      grossCents: parsed.grossCents,
+      netCents: parsed.netCents,
+      category: parsed.category,
+      classification,
+      lineItems: parsed.lineItems
+    } satisfies ParsedInvoice;
+  } catch {
+    return null;
+  }
 }
 
 async function saveInvoiceAttachment({

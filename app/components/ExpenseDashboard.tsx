@@ -90,6 +90,7 @@ type ScanInvoiceDraft = {
   grossCents: number;
   netCents: number;
   vatRate: number;
+  classification: "monthly" | "oneTime" | "uncertain";
   lineItems?: ScanInvoiceLineItem[];
 };
 
@@ -106,11 +107,56 @@ type ScanInvoiceResponse =
   | { status: "attached" | "created"; row: ExpenseRow }
   | { status: "createdMany"; rows: ExpenseRow[] }
   | { status: "duplicate"; row: ExpenseRow; message: string }
-  | { status: "needsConfirmation"; draft: ScanInvoiceDraft };
+  | {
+      status: "needsConfirmation";
+      draft: ScanInvoiceDraft;
+      analysis: string;
+      clientFileId?: string | null;
+    };
 
-type PendingScanConfirmation = {
+type ProcessedScanInvoiceResult = Exclude<ScanInvoiceResponse, { status: "needsConfirmation" }>;
+
+type BatchScanResponse =
+  | {
+      status: "batchCompleted";
+      results: BatchProcessedScanResult[];
+    }
+  | {
+      status: "needsConfirmationMany";
+      results: BatchProcessedScanResult[];
+      pending: BatchPendingScanResult[];
+    };
+
+type PendingBatchScanConfirmation = {
+  items: PendingBatchScanItem[];
+};
+
+type PendingBatchScanItem = {
+  fileId: string;
   file: File;
   draft: ScanInvoiceDraft;
+  analysis: string;
+};
+
+type BatchProcessedScanResult = {
+  fileName: string;
+  clientFileId: string | null;
+  result: ProcessedScanInvoiceResult;
+};
+
+type BatchPendingScanResult = {
+  fileName: string;
+  clientFileId: string | null;
+  draft: ScanInvoiceDraft;
+  analysis: string;
+};
+
+type BatchDecisionMode = "monthly" | "oneTimeCombined" | "oneTimeSeparate";
+
+type BatchScanDecision = {
+  fileId: string;
+  classificationOverride: "monthly" | "oneTime";
+  splitMode?: "combined" | "separate";
 };
 
 type PendingPlacementSuggestion = {
@@ -268,7 +314,7 @@ export function ExpenseDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [pendingScanConfirmation, setPendingScanConfirmation] =
-    useState<PendingScanConfirmation | null>(null);
+    useState<PendingBatchScanConfirmation | null>(null);
   const [pendingPlacementSuggestion, setPendingPlacementSuggestion] =
     useState<PendingPlacementSuggestion | null>(null);
   const [activeColumnMenu, setActiveColumnMenu] = useState<ColumnKey | null>(null);
@@ -279,6 +325,7 @@ export function ExpenseDashboard() {
   const [groupingKey, setGroupingKey] = useState<GroupingKey>("interval");
   const [sortKey, setSortKey] = useState<SortKey>("startMonth");
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+  const [showDocumentHints, setShowDocumentHints] = useState(false);
   const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(() => new Set());
   const [pinnedSelectedRowId, setPinnedSelectedRowId] = useState<string | null>(null);
   const [visibleColumnKeys, setVisibleColumnKeys] = useState<Set<ColumnKey>>(
@@ -774,32 +821,102 @@ export function ExpenseDashboard() {
     }
   }
 
-  async function scanInvoice(
-    file: File | null,
-    classificationOverride?: "monthly" | "oneTime",
-    splitMode?: "combined" | "separate"
+  function isPdfFile(file: File) {
+    return file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+  }
+
+  function applyProcessedScanResult(
+    fileName: string,
+    payload: ProcessedScanInvoiceResult,
+    options?: { suppressNotice?: boolean }
   ) {
-    if (!file) {
+    const suppressNotice = options?.suppressNotice ?? false;
+
+    if (payload.status === "createdMany") {
+      setRows((currentRows) =>
+        payload.rows.reduce(
+          (updatedRows, scannedRow) => upsertScannedRow(updatedRows, scannedRow),
+          currentRows
+        )
+      );
+      const createdYear = payload.rows[0]?.year;
+      if (createdYear) {
+        setAccountingYear(createdYear);
+      }
+      if (!suppressNotice) {
+        setNotice(
+          `${payload.rows.length} Positionen aus "${fileName}" wurden fuer ${createdYear ?? accountingYear} angelegt.`
+        );
+      }
       return;
     }
 
-    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+    setRows((currentRows) => upsertScannedRow(currentRows, payload.row));
+    setAccountingYear(payload.row.year);
+
+    if (suppressNotice) {
+      return;
+    }
+
+    if (payload.status === "attached") {
+      setNotice(`"${fileName}" wurde zu "${payload.row.name || payload.row.description}" hinzugefuegt.`);
+    } else if (payload.status === "duplicate") {
+      setNotice(`"${fileName}": ${payload.message}`);
+    } else {
+      setNotice(`Neue Position "${payload.row.name || payload.row.description}" aus "${fileName}" wurde angelegt.`);
+    }
+  }
+
+  function buildScanSummary(processedCount: number, pendingCount: number) {
+    const processedLabel =
+      processedCount === 0
+        ? "Keine Rechnung wurde direkt verarbeitet"
+        : processedCount === 1
+          ? "1 Rechnung direkt verarbeitet"
+          : `${processedCount} Rechnungen direkt verarbeitet`;
+    if (pendingCount === 0) {
+      return processedLabel;
+    }
+
+    const pendingLabel =
+      pendingCount === 1 ? "1 Rechnung braucht Einordnung" : `${pendingCount} Rechnungen brauchen Einordnung`;
+    return `${processedLabel}. ${pendingLabel}.`;
+  }
+
+  async function scanInvoices(files: FileList | File[] | null | undefined) {
+    if (!files || files.length === 0) {
+      return;
+    }
+
+    const selectedFiles = Array.from(files);
+    const pdfFiles = selectedFiles.filter(isPdfFile);
+    const skippedCount = selectedFiles.length - pdfFiles.length;
+
+    if (pdfFiles.length === 0) {
       setError("Nur PDF-Rechnungen sind erlaubt.");
       return;
     }
 
-    setScanningInvoice(true);
-    setError(null);
+    setError(
+      skippedCount > 0
+        ? `${skippedCount} Datei${skippedCount === 1 ? "" : "en"} wurde uebersprungen. Nur PDFs sind erlaubt.`
+        : null
+    );
     setNotice(null);
+
+    setScanningInvoice(true);
+    setPendingScanConfirmation(null);
 
     try {
       const formData = new FormData();
-      formData.append("file", file);
-      if (classificationOverride) {
-        formData.append("classificationOverride", classificationOverride);
-      }
-      if (splitMode) {
-        formData.append("splitMode", splitMode);
+      const selectedEntries = pdfFiles.map((file) => ({
+        fileId: crypto.randomUUID(),
+        file
+      }));
+
+      for (const entry of selectedEntries) {
+        formData.append("file", entry.file);
+        formData.append("clientFileId", entry.fileId);
       }
 
       const response = await fetch("/api/scan-invoice", {
@@ -812,40 +929,121 @@ export function ExpenseDashboard() {
         throw new Error(payload.message || "Die Rechnung konnte nicht gescannt werden.");
       }
 
-      const payload = (await response.json()) as ScanInvoiceResponse;
-      if (payload.status === "needsConfirmation") {
-        setPendingScanConfirmation({ file, draft: payload.draft });
+      const payload = (await response.json()) as BatchScanResponse | ScanInvoiceResponse;
+
+      if ("results" in payload) {
+        payload.results.forEach((result) =>
+          applyProcessedScanResult(result.fileName, result.result, { suppressNotice: true })
+        );
+
+        if (payload.status === "needsConfirmationMany") {
+          const pendingItems = payload.pending.flatMap((pending) => {
+            if (!pending.clientFileId) {
+              return [];
+            }
+
+            const matchingEntry = selectedEntries.find((entry) => entry.fileId === pending.clientFileId);
+            if (!matchingEntry) {
+              return [];
+            }
+
+            return [
+              {
+                fileId: pending.clientFileId,
+                file: matchingEntry.file,
+                draft: pending.draft,
+                analysis: pending.analysis
+              }
+            ];
+          });
+
+          setPendingScanConfirmation({ items: pendingItems });
+          setNotice(buildScanSummary(payload.results.length, pendingItems.length));
+          return;
+        }
+
+        setNotice(buildScanSummary(payload.results.length, 0));
         return;
+      }
+
+      const firstFile = pdfFiles[0];
+      if (payload.status === "needsConfirmation") {
+        setPendingScanConfirmation({
+          items: [
+            {
+              fileId: payload.clientFileId ?? crypto.randomUUID(),
+              file: firstFile,
+              draft: payload.draft,
+              analysis: payload.analysis
+            }
+          ]
+        });
+        setNotice(buildScanSummary(0, 1));
+        return;
+      }
+
+      applyProcessedScanResult(firstFile.name, payload);
+    } catch (scanError) {
+      setError(scanError instanceof Error ? scanError.message : "Unbekannter Scan-Fehler.");
+    } finally {
+      setScanningInvoice(false);
+    }
+  }
+
+  async function confirmPendingScans(decisions: BatchScanDecision[]) {
+    if (!pendingScanConfirmation) {
+      return;
+    }
+
+    const pendingItems = pendingScanConfirmation.items;
+    const decisionMap = new Map(decisions.map((decision) => [decision.fileId, decision]));
+
+    setScanningInvoice(true);
+    setError(null);
+    setNotice(null);
+
+    try {
+      let processedCount = 0;
+
+      for (const item of pendingItems) {
+        const decision = decisionMap.get(item.fileId);
+        if (!decision) {
+          continue;
+        }
+
+        const formData = new FormData();
+        formData.append("file", item.file);
+        formData.append("analysis", item.analysis);
+        formData.append("classificationOverride", decision.classificationOverride);
+        if (decision.splitMode) {
+          formData.append("splitMode", decision.splitMode);
+        }
+
+        const response = await fetch("/api/scan-invoice", {
+          method: "POST",
+          body: formData
+        });
+
+        if (!response.ok) {
+          const payload = (await response.json()) as { message?: string };
+          throw new Error(payload.message || `Die Rechnung "${item.file.name}" konnte nicht verarbeitet werden.`);
+        }
+
+        const payload = (await response.json()) as ScanInvoiceResponse;
+        if (payload.status === "needsConfirmation") {
+          throw new Error(`Die Rechnung "${item.file.name}" konnte nicht eindeutig verarbeitet werden.`);
+        }
+
+        applyProcessedScanResult(item.file.name, payload, { suppressNotice: true });
+        processedCount += 1;
       }
 
       setPendingScanConfirmation(null);
-      if (payload.status === "createdMany") {
-        setRows((currentRows) =>
-          payload.rows.reduce(
-            (updatedRows, scannedRow) => upsertScannedRow(updatedRows, scannedRow),
-            currentRows
-          )
-        );
-        const createdYear = payload.rows[0]?.year;
-        if (createdYear) {
-          setAccountingYear(createdYear);
-        }
-        setNotice(
-          `${payload.rows.length} Positionen aus der Rechnung wurden fuer ${createdYear ?? accountingYear} angelegt.`
-        );
-        return;
-      }
-
-      setRows((currentRows) => upsertScannedRow(currentRows, payload.row));
-      setAccountingYear(payload.row.year);
-
-      if (payload.status === "attached") {
-        setNotice(`Rechnung wurde zu "${payload.row.name || payload.row.description}" hinzugefuegt.`);
-      } else if (payload.status === "duplicate") {
-        setNotice(payload.message);
-      } else {
-        setNotice(`Neue Position "${payload.row.name || payload.row.description}" wurde angelegt.`);
-      }
+      setNotice(
+        processedCount === 1
+          ? "1 Rechnung aus der Uebersicht wurde verarbeitet."
+          : `${processedCount} Rechnungen aus der Uebersicht wurden verarbeitet.`
+      );
     } catch (scanError) {
       setError(scanError instanceof Error ? scanError.message : "Unbekannter Scan-Fehler.");
     } finally {
@@ -877,7 +1075,7 @@ export function ExpenseDashboard() {
       return;
     }
 
-    scanInvoice(event.dataTransfer.files[0] ?? null);
+    void scanInvoices(event.dataTransfer.files);
   }
 
   return (
@@ -959,15 +1157,16 @@ export function ExpenseDashboard() {
               ) : (
                 <Upload aria-hidden="true" size={16} />
               )}
-              {scanDropActive ? "PDF hier ablegen" : "Rechnung scannen"}
+              {scanDropActive ? "PDFs hier ablegen" : "Rechnungen scannen"}
             </button>
             <input
               ref={scanInvoiceInputRef}
               type="file"
+              multiple
               accept="application/pdf,.pdf"
               className="hidden"
               onChange={(event: ChangeEvent<HTMLInputElement>) => {
-                scanInvoice(event.target.files?.[0] ?? null);
+                void scanInvoices(event.target.files);
                 event.target.value = "";
               }}
             />
@@ -1126,6 +1325,27 @@ export function ExpenseDashboard() {
                   >
                     <ArrowUpDown aria-hidden="true" size={14} />
                     {sortDirection === "asc" ? "Aufsteigend" : "Absteigend"}
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={showDocumentHints}
+                    onClick={() => setShowDocumentHints((current) => !current)}
+                    className={`inline-flex h-8 items-center gap-2 rounded-md border px-3 text-xs font-semibold transition ${
+                      showDocumentHints
+                        ? "border-orange-300 bg-orange-50 text-orange-900 hover:bg-orange-100"
+                        : "border-slate-300 bg-white text-slate-700 hover:bg-slate-50"
+                    }`}
+                    title={
+                      showDocumentHints
+                        ? "Dokumentenhinweise ausblenden und Zeilen weiß anzeigen"
+                        : "Fehlende Dokumente mit roten und orangen Zeilen markieren"
+                    }
+                  >
+                    <span className="inline-flex gap-0.5" aria-hidden="true">
+                      <span className={`h-2.5 w-2.5 rounded-sm ${showDocumentHints ? "bg-red-400" : "border border-slate-300 bg-white"}`} />
+                      <span className={`h-2.5 w-2.5 rounded-sm ${showDocumentHints ? "bg-orange-300" : "border border-slate-300 bg-white"}`} />
+                    </span>
+                    {showDocumentHints ? "UX-Hinweise an" : "Basis weiß"}
                   </button>
                   <button
                     type="button"
@@ -1346,15 +1566,12 @@ export function ExpenseDashboard() {
                         const annualNetCents = getAnnualNetCents(row);
                         const monthlyGrossCents = getMonthlyGrossCents(row);
                         const monthlyNetCents = getMonthlyNetCents(row);
-                        const documentWarning = getDocumentWarning(row);
+                        const documentWarning = showDocumentHints ? getDocumentWarning(row) : null;
 
                         return (
                           <tr
                             key={row.id}
-                            className={`${
-                              documentWarning?.className ??
-                              (index % 2 === 0 ? "bg-white" : "bg-[#e6eef6]")
-                            } ${
+                            className={`${documentWarning?.className ?? "bg-white"} ${
                               isPinnedSelectedRow
                                 ? "shadow-[inset_0_0_0_2px_#2563eb] outline outline-2 outline-blue-600"
                                 : isSelected
@@ -1562,13 +1779,11 @@ export function ExpenseDashboard() {
 
       </section>
       {pendingScanConfirmation ? (
-        <ScanConfirmationDialog
-          draft={pendingScanConfirmation.draft}
+        <BatchScanConfirmationDialog
+          items={pendingScanConfirmation.items}
           scanning={scanningInvoice}
           onCancel={() => setPendingScanConfirmation(null)}
-          onConfirm={(classificationOverride, splitMode) =>
-            scanInvoice(pendingScanConfirmation.file, classificationOverride, splitMode)
-          }
+          onConfirm={confirmPendingScans}
         />
       ) : null}
       {pendingPlacementSuggestion ? (
@@ -1922,75 +2137,174 @@ function Metric({
   );
 }
 
-function ScanConfirmationDialog({
-  draft,
+function getDefaultBatchDecisionMode(draft: ScanInvoiceDraft): BatchDecisionMode {
+  if ((draft.lineItems?.length ?? 0) > 1) {
+    return "oneTimeCombined";
+  }
+
+  return draft.classification === "monthly" ? "monthly" : "oneTimeCombined";
+}
+
+function getBatchDecision(mode: BatchDecisionMode): Omit<BatchScanDecision, "fileId"> {
+  if (mode === "monthly") {
+    return { classificationOverride: "monthly", splitMode: "combined" };
+  }
+
+  if (mode === "oneTimeSeparate") {
+    return { classificationOverride: "oneTime", splitMode: "separate" };
+  }
+
+  return { classificationOverride: "oneTime", splitMode: "combined" };
+}
+
+function BatchScanConfirmationDialog({
+  items,
   scanning,
   onCancel,
   onConfirm
 }: {
-  draft: ScanInvoiceDraft;
+  items: PendingBatchScanItem[];
   scanning: boolean;
   onCancel: () => void;
-  onConfirm: (
-    classificationOverride: "monthly" | "oneTime",
-    splitMode?: "combined" | "separate"
-  ) => void;
+  onConfirm: (decisions: BatchScanDecision[]) => void;
 }) {
-  const invoiceDate = new Date(draft.invoiceDate);
-  const formattedDate = Number.isNaN(invoiceDate.getTime())
-    ? "-"
-    : invoiceDate.toLocaleDateString("de-AT");
-  const lineItems = draft.lineItems ?? [];
-  const hasLineItemSuggestion = lineItems.length > 1;
+  const [decisionModes, setDecisionModes] = useState<Record<string, BatchDecisionMode>>(() =>
+    Object.fromEntries(items.map((item) => [item.fileId, getDefaultBatchDecisionMode(item.draft)]))
+  );
+
+  function setAllDecisionModes(mode: BatchDecisionMode) {
+    setDecisionModes(
+      Object.fromEntries(
+        items.map((item) => [
+          item.fileId,
+          (item.draft.lineItems?.length ?? 0) > 1 || mode !== "oneTimeSeparate" ? mode : "oneTimeCombined"
+        ])
+      )
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/35 px-4">
-      <section className="w-full max-w-2xl rounded-md border border-slate-300 bg-white shadow-xl">
+      <section className="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-md border border-slate-300 bg-white shadow-xl">
         <div className="border-b border-slate-200 px-4 py-3">
-          <h2 className="text-base font-semibold text-slate-950">Rechnung einordnen</h2>
+          <h2 className="text-base font-semibold text-slate-950">Rechnungen gesammelt einordnen</h2>
+          <p className="mt-1 text-sm text-slate-600">
+            {items.length === 1
+              ? "1 Rechnung braucht noch eine Entscheidung."
+              : `${items.length} Rechnungen brauchen noch eine Entscheidung.`}
+          </p>
         </div>
-        <div className="grid gap-2 px-4 py-4 text-sm text-slate-700">
-          <DraftRow label="Anbieter" value={draft.vendor || "-"} />
-          <DraftRow label="Leistung" value={draft.service || draft.description || "-"} />
-          <DraftRow label="Datum" value={formattedDate} />
-          <DraftRow label="Rechnungsnr." value={draft.invoiceId || "-"} />
-          <DraftRow label="Brutto" value={formatMoney(draft.grossCents)} />
-          <DraftRow label="Netto" value={formatMoney(draft.netCents)} />
-          <DraftRow label="USt" value={`${Math.round(draft.vatRate * 100)}%`} />
-          {hasLineItemSuggestion ? (
-            <div className="mt-3 rounded-md border border-blue-200 bg-blue-50">
-              <div className="flex items-center justify-between gap-3 border-b border-blue-100 px-3 py-2">
-                <span className="text-xs font-semibold uppercase tracking-[0.08em] text-blue-900">
-                  {lineItems.length} Positionen erkannt
-                </span>
-                <span className="text-xs font-semibold text-blue-900">
-                  {formatMoney(lineItems.reduce((sum, item) => sum + item.grossCents, 0))}
-                </span>
-              </div>
-              <div className="max-h-56 overflow-y-auto">
-                {lineItems.map((item, index) => (
-                  <div
-                    key={`${item.description}-${index}`}
-                    className="grid grid-cols-[1fr_auto] gap-3 border-b border-blue-100 px-3 py-2 last:border-b-0"
-                  >
-                    <div className="min-w-0">
-                      <div className="break-words font-semibold text-slate-950">
-                        {item.description}
-                      </div>
-                      <div className="mt-0.5 text-xs text-slate-600">
-                        {item.asin ? `ASIN ${item.asin} · ` : ""}
-                        {item.category} · Netto {formatMoney(item.netCents)} · USt{" "}
-                        {Math.round(item.vatRate * 100)}%
-                      </div>
-                    </div>
-                    <div className="whitespace-nowrap text-right font-semibold text-slate-950">
-                      {formatMoney(item.grossCents)}
+        <div className="flex flex-wrap gap-2 border-b border-slate-200 px-4 py-3">
+          <button
+            type="button"
+            onClick={() => setAllDecisionModes("monthly")}
+            disabled={scanning}
+            className="inline-flex h-8 items-center rounded-md border border-slate-300 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Alle monatlich
+          </button>
+          <button
+            type="button"
+            onClick={() => setAllDecisionModes("oneTimeCombined")}
+            disabled={scanning}
+            className="inline-flex h-8 items-center rounded-md border border-slate-300 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Alle einmalig
+          </button>
+          <button
+            type="button"
+            onClick={() => setAllDecisionModes("oneTimeSeparate")}
+            disabled={scanning}
+            className="inline-flex h-8 items-center rounded-md border border-slate-300 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Positionen einzeln
+          </button>
+        </div>
+        <div className="grid max-h-[60vh] gap-4 overflow-y-auto px-4 py-4">
+          {items.map((item) => {
+            const invoiceDate = new Date(item.draft.invoiceDate);
+            const formattedDate = Number.isNaN(invoiceDate.getTime())
+              ? "-"
+              : invoiceDate.toLocaleDateString("de-AT");
+            const lineItems = item.draft.lineItems ?? [];
+            const hasLineItemSuggestion = lineItems.length > 1;
+
+            return (
+              <div key={item.fileId} className="rounded-md border border-slate-200">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-950">{item.file.name}</div>
+                    <div className="text-xs text-slate-500">
+                      {item.draft.classification === "uncertain"
+                        ? "Modell konnte die Art nicht sicher bestimmen"
+                        : item.draft.classification === "monthly"
+                          ? "Modell vermutet monatliche Ausgabe"
+                          : "Modell vermutet einmalige Ausgabe"}
                     </div>
                   </div>
-                ))}
+                  <select
+                    value={decisionModes[item.fileId]}
+                    onChange={(event) =>
+                      setDecisionModes((current) => ({
+                        ...current,
+                        [item.fileId]: event.target.value as BatchDecisionMode
+                      }))
+                    }
+                    className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-900 outline-none transition focus:border-blue-500"
+                  >
+                    <option value="monthly">Als monatlich speichern</option>
+                    <option value="oneTimeCombined">Als einmalig speichern</option>
+                    {hasLineItemSuggestion ? (
+                      <option value="oneTimeSeparate">Einzeln speichern</option>
+                    ) : null}
+                  </select>
+                </div>
+                <div className="grid gap-2 px-4 py-4 text-sm text-slate-700">
+                  <DraftRow label="Anbieter" value={item.draft.vendor || "-"} />
+                  <DraftRow label="Leistung" value={item.draft.service || item.draft.description || "-"} />
+                  <DraftRow label="Datum" value={formattedDate} />
+                  <DraftRow label="Rechnungsnr." value={item.draft.invoiceId || "-"} />
+                  <DraftRow label="Brutto" value={formatMoney(item.draft.grossCents)} />
+                  <DraftRow label="Netto" value={formatMoney(item.draft.netCents)} />
+                  <DraftRow label="USt" value={`${Math.round(item.draft.vatRate * 100)}%`} />
+                  {hasLineItemSuggestion ? (
+                    <div className="mt-3 rounded-md border border-blue-200 bg-blue-50">
+                      <div className="flex items-center justify-between gap-3 border-b border-blue-100 px-3 py-2">
+                        <span className="text-xs font-semibold uppercase tracking-[0.08em] text-blue-900">
+                          {lineItems.length} Positionen erkannt
+                        </span>
+                        <span className="text-xs font-semibold text-blue-900">
+                          {formatMoney(lineItems.reduce((sum, lineItem) => sum + lineItem.grossCents, 0))}
+                        </span>
+                      </div>
+                      <div className="max-h-56 overflow-y-auto">
+                        {lineItems.map((lineItem, index) => (
+                          <div
+                            key={`${lineItem.description}-${index}`}
+                            className="grid grid-cols-[1fr_auto] gap-3 border-b border-blue-100 px-3 py-2 last:border-b-0"
+                          >
+                            <div className="min-w-0">
+                              <div className="break-words font-semibold text-slate-950">
+                                {lineItem.description}
+                              </div>
+                              <div className="mt-0.5 text-xs text-slate-600">
+                                {lineItem.asin ? `ASIN ${lineItem.asin} · ` : ""}
+                                {lineItem.category} · Netto {formatMoney(lineItem.netCents)} · USt{" "}
+                                {Math.round(lineItem.vatRate * 100)}%
+                              </div>
+                            </div>
+                            <div className="whitespace-nowrap text-right font-semibold text-slate-950">
+                              {formatMoney(lineItem.grossCents)}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
               </div>
-            </div>
-          ) : null}
+            );
+          })}
         </div>
         <div className="flex flex-wrap justify-end gap-2 border-t border-slate-200 px-4 py-3">
           <button
@@ -2003,31 +2317,19 @@ function ScanConfirmationDialog({
           </button>
           <button
             type="button"
-            onClick={() => onConfirm("oneTime", hasLineItemSuggestion ? "combined" : undefined)}
-            disabled={scanning}
-            className="inline-flex h-9 items-center rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {hasLineItemSuggestion ? "Als Gesamtbetrag speichern" : "Als einmalig speichern"}
-          </button>
-          {hasLineItemSuggestion ? (
-            <button
-              type="button"
-              onClick={() => onConfirm("oneTime", "separate")}
-              disabled={scanning}
-              className="inline-flex h-9 items-center rounded-md bg-emerald-700 px-3 text-sm font-semibold text-white transition hover:bg-emerald-800 disabled:cursor-not-allowed disabled:bg-emerald-300"
-            >
-              {scanning ? <Loader2 aria-hidden="true" className="mr-2 animate-spin" size={15} /> : null}
-              Einzeln speichern
-            </button>
-          ) : null}
-          <button
-            type="button"
-            onClick={() => onConfirm("monthly", hasLineItemSuggestion ? "combined" : undefined)}
+            onClick={() =>
+              onConfirm(
+                items.map((item) => ({
+                  fileId: item.fileId,
+                  ...getBatchDecision(decisionModes[item.fileId] ?? getDefaultBatchDecisionMode(item.draft))
+                }))
+              )
+            }
             disabled={scanning}
             className="inline-flex h-9 items-center rounded-md bg-blue-700 px-3 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-blue-300"
           >
             {scanning ? <Loader2 aria-hidden="true" className="mr-2 animate-spin" size={15} /> : null}
-            Als monatlich speichern
+            Alle uebernehmen
           </button>
         </div>
       </section>
