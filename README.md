@@ -155,6 +155,6 @@ This repository does not redistribute Ollama, Poppler, Node.js, or model weights
 
 ## License
 
-Buchhaltung is available under the [MIT License](LICENSE), the same license used by [OpenClaw](https://github.com/openclaw/openclaw).
+Buchhaltung is available under the [MIT License](LICENSE).
 
 Copyright 2026 Fatih Ayazoglu. Contact: fatih.ayazogl@zero2one.at.
