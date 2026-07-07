@@ -24,6 +24,8 @@ The recommended model is [`qwen3-vl:8b-instruct`](https://ollama.com/library/qwe
 
 ## Installation
 
+Prefer guided setup? Copy one of the prompts from [AI-Assisted Installation Prompts](AI_INSTALLATION.md) into a coding assistant that can guide or operate your terminal.
+
 ### 1. Install Node.js
 
 Install Node.js 20 or newer from [nodejs.org](https://nodejs.org/) and verify it:
@@ -85,7 +87,7 @@ The model is downloaded by Ollama and is not part of this repository.
 git clone https://github.com/azoglufatih/buchhaltung.git
 cd buchhaltung
 npm install
-cp .env.example .env.local
+cp .env.example .env
 ```
 
 The default `.env.example` points to the local Ollama service:
@@ -96,7 +98,7 @@ OLLAMA_INVOICE_MODEL=qwen3-vl:8b-instruct
 OLLAMA_CHAT_MODEL=qwen3-vl:8b-instruct
 ```
 
-If the user's own local LLM server is reachable at another URL or uses other Ollama-compatible model names, they should change these values in `.env.local`. Environment files are ignored by Git.
+If the user's own local LLM server is reachable at another URL or uses other Ollama-compatible model names, they should change these values in `.env`. The `.env` file is ignored by Git; `.env.example` is only the version-controlled template and must not contain secrets.
 
 ### 6. Run the application locally
 
