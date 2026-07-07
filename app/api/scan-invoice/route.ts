@@ -64,6 +64,24 @@ type ProcessedScanResult =
   | { status: "createdMany"; rows: ExpenseRow[] }
   | { status: "duplicate"; row: ExpenseRow; message: string };
 
+type SuggestedDecision = {
+  classificationOverride: ClassificationOverride;
+  splitMode: SplitMode;
+};
+
+type PreviewResult = {
+  status: "preview";
+  fileName: string;
+  clientFileId: string | null;
+  draft: ScanInvoiceDraft;
+  analysis: string;
+  suggestedDecision: SuggestedDecision;
+  predictedOutcome: "duplicate" | "attach" | "create" | "createMany";
+  targetRowId: string | null;
+  targetRowLabel: string | null;
+  message: string;
+};
+
 type PendingConfirmationResult = {
   status: "needsConfirmation";
   draft: ScanInvoiceDraft;
@@ -71,7 +89,8 @@ type PendingConfirmationResult = {
   clientFileId: string | null;
 };
 
-type ScanInvoiceResult = ProcessedScanResult | PendingConfirmationResult;
+type ScanInvoiceResult = ProcessedScanResult | PendingConfirmationResult | PreviewResult;
+type CommitScanInvoiceResult = ProcessedScanResult | PendingConfirmationResult;
 
 const knownVatRates = [0.2, 0.13, 0.1, 0];
 const execFileAsync = promisify(execFile);
@@ -85,6 +104,7 @@ export async function POST(request: Request) {
   const classificationOverride = parseClassificationOverride(formData.get("classificationOverride"));
   const splitMode = parseSplitMode(formData.get("splitMode"));
   const serializedAnalysis = formData.get("analysis");
+  const previewMode = formData.get("preview") === "true";
 
   if (files.length === 0) {
     return NextResponse.json({ message: "Keine PDF-Rechnung gefunden." }, { status: 400 });
@@ -97,6 +117,51 @@ export async function POST(request: Request) {
 
   const payload = await readExpenses();
   try {
+    if (previewMode) {
+      const preparedFiles = [];
+
+      for (const [index, file] of files.entries()) {
+        const prepared = await prepareInvoiceFile({
+          file,
+          preParsedInvoice: null
+        });
+        preparedFiles.push({
+          ...prepared,
+          file,
+          clientFileId: clientFileIds[index] ?? null
+        });
+      }
+
+      const groupKeyCounts = countPreviewGroupKeys(preparedFiles.map((entry) => entry.parsedInvoice));
+      const previewRows = cloneRowsForPreview(payload.rows);
+      const items = [];
+
+      for (const prepared of preparedFiles) {
+        const result = await buildPreviewResult({
+          rows: previewRows,
+          file: prepared.file,
+          clientFileId: prepared.clientFileId,
+          parsedInvoice: prepared.parsedInvoice,
+          fileHash: prepared.fileHash,
+          scanId: prepared.scanId,
+          hasBatchRelation: hasRepeatedPreviewGroup(prepared.parsedInvoice, groupKeyCounts)
+        });
+        items.push(result);
+        applyPreviewResultToRows({
+          rows: previewRows,
+          parsedInvoice: prepared.parsedInvoice,
+          file: prepared.file,
+          fileHash: prepared.fileHash,
+          preview: result
+        });
+      }
+
+      return NextResponse.json({
+        status: "previewMany",
+        items
+      });
+    }
+
     if (files.length === 1) {
       const result = await processInvoiceFile({
         payload,
@@ -174,21 +239,13 @@ export async function POST(request: Request) {
   }
 }
 
-async function processInvoiceFile({
-  payload,
+async function prepareInvoiceFile({
   file,
-  clientFileId,
-  classificationOverride,
-  splitMode,
   preParsedInvoice
 }: {
-  payload: Awaited<ReturnType<typeof readExpenses>>;
   file: File;
-  clientFileId: string | null;
-  classificationOverride: ClassificationOverride | null;
-  splitMode: SplitMode | null;
   preParsedInvoice: ParsedInvoice | null;
-}): Promise<ScanInvoiceResult> {
+}) {
   if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
     throw new InvoiceVisionError("Nur PDF-Rechnungen sind erlaubt.", 415);
   }
@@ -232,6 +289,214 @@ async function processInvoiceFile({
       serviceKey: normalizeSubscriptionKey(visionInvoice.name)
     };
   }
+
+  return {
+    buffer,
+    originalName,
+    fileHash,
+    scanId,
+    parsedInvoice
+  };
+}
+
+function getSuggestedDecision(
+  invoice: ParsedInvoice,
+  relatedRow: ExpenseRow | null,
+  hasBatchRelation: boolean
+): SuggestedDecision {
+  if (relatedRow || hasBatchRelation || invoice.classification === "monthly") {
+    return {
+      classificationOverride: "monthly",
+      splitMode: "combined"
+    };
+  }
+
+  return {
+    classificationOverride: "oneTime",
+    splitMode: "combined"
+  };
+}
+
+async function buildPreviewResult({
+  rows,
+  file,
+  clientFileId,
+  parsedInvoice,
+  fileHash,
+  scanId,
+  hasBatchRelation
+}: {
+  rows: ExpenseRow[];
+  file: File;
+  clientFileId: string | null;
+  parsedInvoice: ParsedInvoice;
+  fileHash: string;
+  scanId: string;
+  hasBatchRelation: boolean;
+}): Promise<PreviewResult> {
+  const duplicateRow = findDuplicateInvoiceRow(rows, parsedInvoice.invoiceId, fileHash);
+  const relatedRow = duplicateRow ? null : findRelatedSubscriptionRow(rows, parsedInvoice);
+  const suggestedDecision = getSuggestedDecision(parsedInvoice, relatedRow, hasBatchRelation);
+  const shouldSuggestLineItemSplit = !relatedRow && parsedInvoice.lineItems.length > 1;
+
+  let predictedOutcome: PreviewResult["predictedOutcome"];
+  let targetRowId: string | null = null;
+  let targetRowLabel: string | null = null;
+  let message: string;
+
+  if (duplicateRow) {
+    predictedOutcome = "duplicate";
+    targetRowId = duplicateRow.id;
+    targetRowLabel = duplicateRow.name || duplicateRow.description;
+    message = "Diese Rechnung ist bereits vorhanden. Verwerfen wird empfohlen.";
+  } else if (relatedRow || suggestedDecision.classificationOverride === "monthly") {
+    predictedOutcome = "attach";
+    targetRowId = relatedRow?.id ?? null;
+    targetRowLabel = relatedRow?.name || relatedRow?.description || null;
+    message = targetRowLabel
+      ? `Wird als monatliche Rechnung zu "${targetRowLabel}" eingeordnet.`
+      : hasBatchRelation
+        ? "Wird aufgrund verwandter Rechnungen in diesem Upload als monatlich empfohlen."
+        : "Wird als monatliche Rechnung empfohlen.";
+  } else if (
+    suggestedDecision.classificationOverride === "oneTime" &&
+    suggestedDecision.splitMode === "separate" &&
+    parsedInvoice.lineItems.length > 1
+  ) {
+    predictedOutcome = "createMany";
+    message = `${parsedInvoice.lineItems.length} einzelne Positionen wuerden angelegt.`;
+  } else {
+    predictedOutcome = "create";
+    message =
+      shouldSuggestLineItemSplit
+        ? "Wuerde als einmalige Gesamtposition angelegt. Einzelne Positionen sind ebenfalls moeglich."
+        : "Wuerde als neue einmalige Position angelegt.";
+  }
+
+  await recordActivity({
+    level: "info",
+    source: "scanner",
+    scanId,
+    message: "Rechnungsvorschau erstellt.",
+    details: {
+      classification: parsedInvoice.classification,
+      predictedOutcome,
+      suggestedDecision: `${suggestedDecision.classificationOverride}:${suggestedDecision.splitMode}`
+    }
+  });
+
+  return {
+    status: "preview",
+    fileName: file.name,
+    clientFileId,
+    draft: buildInvoiceDraft(parsedInvoice),
+    analysis: serializeParsedInvoice(parsedInvoice),
+    suggestedDecision,
+    predictedOutcome,
+    targetRowId,
+    targetRowLabel,
+    message
+  };
+}
+
+function cloneRowsForPreview(rows: ExpenseRow[]) {
+  return rows.map((row) => ({
+    ...row,
+    invoiceFile: [...row.invoiceFile],
+    cardStatementFile: [...row.cardStatementFile]
+  }));
+}
+
+function getPreviewGroupKeys(invoice: ParsedInvoice) {
+  return [invoice.subscriptionKey, invoice.serviceKey].filter((key): key is string => Boolean(key));
+}
+
+function countPreviewGroupKeys(invoices: ParsedInvoice[]) {
+  const counts = new Map<string, number>();
+
+  for (const invoice of invoices) {
+    for (const key of new Set(getPreviewGroupKeys(invoice))) {
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+
+  return counts;
+}
+
+function hasRepeatedPreviewGroup(invoice: ParsedInvoice, counts: Map<string, number>) {
+  return getPreviewGroupKeys(invoice).some((key) => (counts.get(key) ?? 0) > 1);
+}
+
+function buildPreviewAttachment(file: File, fileHash: string, parsedInvoice: ParsedInvoice): FileAttachment {
+  return {
+    name: file.name,
+    path: `preview://${fileHash}`,
+    size: file.size,
+    uploadedAt: new Date().toISOString(),
+    paymentDate: parsedInvoice.invoiceDate.toISOString(),
+    invoiceId: parsedInvoice.invoiceId ?? undefined,
+    invoiceDate: parsedInvoice.invoiceDate.toISOString(),
+    grossCents: parsedInvoice.grossCents,
+    netCents: parsedInvoice.netCents,
+    vatRate: parsedInvoice.vatRate,
+    fileHash
+  };
+}
+
+function applyPreviewResultToRows({
+  rows,
+  parsedInvoice,
+  file,
+  fileHash,
+  preview
+}: {
+  rows: ExpenseRow[];
+  parsedInvoice: ParsedInvoice;
+  file: File;
+  fileHash: string;
+  preview: PreviewResult;
+}) {
+  if (preview.predictedOutcome === "duplicate") {
+    return;
+  }
+
+  const attachment = buildPreviewAttachment(file, fileHash, parsedInvoice);
+
+  if (preview.predictedOutcome === "attach" && preview.targetRowId) {
+    const targetRow = rows.find((row) => row.id === preview.targetRowId);
+    if (targetRow) {
+      targetRow.invoiceFile = appendAttachment(targetRow.invoiceFile, attachment);
+      return;
+    }
+  }
+
+  const invoiceForPreview: ParsedInvoice = {
+    ...parsedInvoice,
+    classification: preview.suggestedDecision.classificationOverride
+  };
+  const newRow = buildRowFromInvoice(invoiceForPreview);
+  newRow.invoiceFile = appendAttachment(newRow.invoiceFile, attachment);
+  rows.push(newRow);
+}
+
+async function processInvoiceFile({
+  payload,
+  file,
+  clientFileId,
+  classificationOverride,
+  splitMode,
+  preParsedInvoice
+}: {
+  payload: Awaited<ReturnType<typeof readExpenses>>;
+  file: File;
+  clientFileId: string | null;
+  classificationOverride: ClassificationOverride | null;
+  splitMode: SplitMode | null;
+  preParsedInvoice: ParsedInvoice | null;
+}): Promise<CommitScanInvoiceResult> {
+  const { buffer, originalName, fileHash, scanId, parsedInvoice: preparedInvoice } =
+    await prepareInvoiceFile({ file, preParsedInvoice });
+  let parsedInvoice = preparedInvoice;
 
   parsedInvoice = {
     ...parsedInvoice,
@@ -622,11 +887,7 @@ async function saveInvoiceAttachment({
   return attachment;
 }
 
-function findMatchingSubscriptionRow(rows: ExpenseRow[], invoice: ParsedInvoice) {
-  if (invoice.classification !== "monthly") {
-    return null;
-  }
-
+function findRelatedSubscriptionRow(rows: ExpenseRow[], invoice: ParsedInvoice) {
   const candidateKeys = new Set(
     [invoice.subscriptionKey, invoice.serviceKey].filter((key): key is string => Boolean(key))
   );
@@ -651,6 +912,14 @@ function findMatchingSubscriptionRow(rows: ExpenseRow[], invoice: ParsedInvoice)
       );
     }) ?? null
   );
+}
+
+function findMatchingSubscriptionRow(rows: ExpenseRow[], invoice: ParsedInvoice) {
+  if (invoice.classification !== "monthly") {
+    return null;
+  }
+
+  return findRelatedSubscriptionRow(rows, invoice);
 }
 
 function isDuplicateInvoice(row: ExpenseRow, invoiceId: string | null, fileHash: string) {

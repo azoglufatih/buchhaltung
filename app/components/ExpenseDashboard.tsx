@@ -116,16 +116,10 @@ type ScanInvoiceResponse =
 
 type ProcessedScanInvoiceResult = Exclude<ScanInvoiceResponse, { status: "needsConfirmation" }>;
 
-type BatchScanResponse =
-  | {
-      status: "batchCompleted";
-      results: BatchProcessedScanResult[];
-    }
-  | {
-      status: "needsConfirmationMany";
-      results: BatchProcessedScanResult[];
-      pending: BatchPendingScanResult[];
-    };
+type PreviewBatchResponse = {
+  status: "previewMany";
+  items: PreviewBatchItem[];
+};
 
 type PendingBatchScanConfirmation = {
   items: PendingBatchScanItem[];
@@ -136,27 +130,39 @@ type PendingBatchScanItem = {
   file: File;
   draft: ScanInvoiceDraft;
   analysis: string;
+  suggestedDecision: {
+    classificationOverride: "monthly" | "oneTime";
+    splitMode: "combined" | "separate";
+  };
+  predictedOutcome: "duplicate" | "attach" | "create" | "createMany";
+  targetRowId: string | null;
+  targetRowLabel: string | null;
+  message: string;
 };
 
-type BatchProcessedScanResult = {
-  fileName: string;
-  clientFileId: string | null;
-  result: ProcessedScanInvoiceResult;
-};
-
-type BatchPendingScanResult = {
+type PreviewBatchItem = {
+  status: "preview";
   fileName: string;
   clientFileId: string | null;
   draft: ScanInvoiceDraft;
   analysis: string;
+  suggestedDecision: {
+    classificationOverride: "monthly" | "oneTime";
+    splitMode: "combined" | "separate";
+  };
+  predictedOutcome: "duplicate" | "attach" | "create" | "createMany";
+  targetRowId: string | null;
+  targetRowLabel: string | null;
+  message: string;
 };
 
-type BatchDecisionMode = "monthly" | "oneTimeCombined" | "oneTimeSeparate";
+type BatchDecisionMode = "monthly" | "oneTimeCombined" | "oneTimeSeparate" | "discard";
 
 type BatchScanDecision = {
   fileId: string;
-  classificationOverride: "monthly" | "oneTime";
+  classificationOverride?: "monthly" | "oneTime";
   splitMode?: "combined" | "separate";
+  discard?: boolean;
 };
 
 type PendingPlacementSuggestion = {
@@ -867,20 +873,10 @@ export function ExpenseDashboard() {
     }
   }
 
-  function buildScanSummary(processedCount: number, pendingCount: number) {
-    const processedLabel =
-      processedCount === 0
-        ? "Keine Rechnung wurde direkt verarbeitet"
-        : processedCount === 1
-          ? "1 Rechnung direkt verarbeitet"
-          : `${processedCount} Rechnungen direkt verarbeitet`;
-    if (pendingCount === 0) {
-      return processedLabel;
-    }
-
-    const pendingLabel =
-      pendingCount === 1 ? "1 Rechnung braucht Einordnung" : `${pendingCount} Rechnungen brauchen Einordnung`;
-    return `${processedLabel}. ${pendingLabel}.`;
+  function buildPreviewSummary(itemCount: number) {
+    return itemCount === 1
+      ? "1 Rechnung wurde analysiert. Vorschlag wird angezeigt."
+      : `${itemCount} Rechnungen wurden analysiert. Vorschlaege werden angezeigt.`;
   }
 
   async function scanInvoices(files: FileList | File[] | null | undefined) {
@@ -919,6 +915,8 @@ export function ExpenseDashboard() {
         formData.append("clientFileId", entry.fileId);
       }
 
+      formData.append("preview", "true");
+
       const response = await fetch("/api/scan-invoice", {
         method: "POST",
         body: formData
@@ -929,40 +927,36 @@ export function ExpenseDashboard() {
         throw new Error(payload.message || "Die Rechnung konnte nicht gescannt werden.");
       }
 
-      const payload = (await response.json()) as BatchScanResponse | ScanInvoiceResponse;
+      const payload = (await response.json()) as PreviewBatchResponse | ScanInvoiceResponse;
 
-      if ("results" in payload) {
-        payload.results.forEach((result) =>
-          applyProcessedScanResult(result.fileName, result.result, { suppressNotice: true })
-        );
+      if ("items" in payload) {
+        const previewItems = payload.items.flatMap((item) => {
+          if (!item.clientFileId) {
+            return [];
+          }
 
-        if (payload.status === "needsConfirmationMany") {
-          const pendingItems = payload.pending.flatMap((pending) => {
-            if (!pending.clientFileId) {
-              return [];
+          const matchingEntry = selectedEntries.find((entry) => entry.fileId === item.clientFileId);
+          if (!matchingEntry) {
+            return [];
+          }
+
+          return [
+            {
+              fileId: item.clientFileId,
+              file: matchingEntry.file,
+              draft: item.draft,
+              analysis: item.analysis,
+              suggestedDecision: item.suggestedDecision,
+              predictedOutcome: item.predictedOutcome,
+              targetRowId: item.targetRowId,
+              targetRowLabel: item.targetRowLabel,
+              message: item.message
             }
+          ];
+        });
 
-            const matchingEntry = selectedEntries.find((entry) => entry.fileId === pending.clientFileId);
-            if (!matchingEntry) {
-              return [];
-            }
-
-            return [
-              {
-                fileId: pending.clientFileId,
-                file: matchingEntry.file,
-                draft: pending.draft,
-                analysis: pending.analysis
-              }
-            ];
-          });
-
-          setPendingScanConfirmation({ items: pendingItems });
-          setNotice(buildScanSummary(payload.results.length, pendingItems.length));
-          return;
-        }
-
-        setNotice(buildScanSummary(payload.results.length, 0));
+        setPendingScanConfirmation({ items: previewItems });
+        setNotice(buildPreviewSummary(previewItems.length));
         return;
       }
 
@@ -974,11 +968,20 @@ export function ExpenseDashboard() {
               fileId: payload.clientFileId ?? crypto.randomUUID(),
               file: firstFile,
               draft: payload.draft,
-              analysis: payload.analysis
+              analysis: payload.analysis,
+              suggestedDecision: {
+                classificationOverride: payload.draft.classification === "monthly" ? "monthly" : "oneTime",
+                splitMode:
+                  payload.draft.classification === "monthly" ? "combined" : "combined"
+              },
+              predictedOutcome: "create",
+              targetRowId: null,
+              targetRowLabel: null,
+              message: "Vorschlag wird angezeigt."
             }
           ]
         });
-        setNotice(buildScanSummary(0, 1));
+        setNotice(buildPreviewSummary(1));
         return;
       }
 
@@ -1004,6 +1007,7 @@ export function ExpenseDashboard() {
 
     try {
       let processedCount = 0;
+      let discardedCount = 0;
 
       for (const item of pendingItems) {
         const decision = decisionMap.get(item.fileId);
@@ -1011,10 +1015,17 @@ export function ExpenseDashboard() {
           continue;
         }
 
+        if (decision.discard) {
+          discardedCount += 1;
+          continue;
+        }
+
         const formData = new FormData();
         formData.append("file", item.file);
         formData.append("analysis", item.analysis);
-        formData.append("classificationOverride", decision.classificationOverride);
+        if (decision.classificationOverride) {
+          formData.append("classificationOverride", decision.classificationOverride);
+        }
         if (decision.splitMode) {
           formData.append("splitMode", decision.splitMode);
         }
@@ -1040,9 +1051,18 @@ export function ExpenseDashboard() {
 
       setPendingScanConfirmation(null);
       setNotice(
-        processedCount === 1
-          ? "1 Rechnung aus der Uebersicht wurde verarbeitet."
-          : `${processedCount} Rechnungen aus der Uebersicht wurden verarbeitet.`
+        [
+          processedCount === 1
+            ? "1 Rechnung wurde verarbeitet"
+            : `${processedCount} Rechnungen wurden verarbeitet`,
+          discardedCount === 0
+            ? null
+            : discardedCount === 1
+              ? "1 Rechnung wurde verworfen"
+              : `${discardedCount} Rechnungen wurden verworfen`
+        ]
+          .filter(Boolean)
+          .join(". ") + "."
       );
     } catch (scanError) {
       setError(scanError instanceof Error ? scanError.message : "Unbekannter Scan-Fehler.");
@@ -2137,15 +2157,27 @@ function Metric({
   );
 }
 
-function getDefaultBatchDecisionMode(draft: ScanInvoiceDraft): BatchDecisionMode {
-  if ((draft.lineItems?.length ?? 0) > 1) {
-    return "oneTimeCombined";
+function getDefaultBatchDecisionMode(item: PendingBatchScanItem): BatchDecisionMode {
+  if (item.predictedOutcome === "duplicate") {
+    return "discard";
   }
 
-  return draft.classification === "monthly" ? "monthly" : "oneTimeCombined";
+  if (item.suggestedDecision.classificationOverride === "monthly") {
+    return "monthly";
+  }
+
+  if (item.suggestedDecision.splitMode === "separate" && (item.draft.lineItems?.length ?? 0) > 1) {
+    return "oneTimeSeparate";
+  }
+
+  return "oneTimeCombined";
 }
 
 function getBatchDecision(mode: BatchDecisionMode): Omit<BatchScanDecision, "fileId"> {
+  if (mode === "discard") {
+    return { discard: true };
+  }
+
   if (mode === "monthly") {
     return { classificationOverride: "monthly", splitMode: "combined" };
   }
@@ -2155,6 +2187,50 @@ function getBatchDecision(mode: BatchDecisionMode): Omit<BatchScanDecision, "fil
   }
 
   return { classificationOverride: "oneTime", splitMode: "combined" };
+}
+
+function getPredictedOutcomeLabel(item: PendingBatchScanItem) {
+  if (item.predictedOutcome === "duplicate") {
+    return "Bereits vorhanden - Verwerfen empfohlen";
+  }
+
+  if (item.predictedOutcome === "attach") {
+    return item.targetRowLabel
+      ? `An bestehende Position anhaengen: ${item.targetRowLabel}`
+      : "An bestehende Position anhaengen";
+  }
+
+  if (item.predictedOutcome === "createMany") {
+    return "Mehrere Positionen anlegen";
+  }
+
+  return item.suggestedDecision.classificationOverride === "monthly"
+    ? "Neue monatliche Position anlegen"
+    : "Neue einmalige Position anlegen";
+}
+
+function getPreviewCardTone(item: PendingBatchScanItem) {
+  if (item.predictedOutcome === "duplicate") {
+    return {
+      container: "border-red-300 bg-red-50",
+      header: "border-red-200 bg-red-100/70",
+      text: "text-red-800"
+    };
+  }
+
+  if (item.predictedOutcome === "attach") {
+    return {
+      container: "border-blue-200 bg-blue-50/50",
+      header: "border-blue-200 bg-blue-50",
+      text: "text-blue-800"
+    };
+  }
+
+  return {
+    container: "border-slate-200 bg-white",
+    header: "border-slate-200 bg-white",
+    text: "text-slate-500"
+  };
 }
 
 function BatchScanConfirmationDialog({
@@ -2169,7 +2245,7 @@ function BatchScanConfirmationDialog({
   onConfirm: (decisions: BatchScanDecision[]) => void;
 }) {
   const [decisionModes, setDecisionModes] = useState<Record<string, BatchDecisionMode>>(() =>
-    Object.fromEntries(items.map((item) => [item.fileId, getDefaultBatchDecisionMode(item.draft)]))
+    Object.fromEntries(items.map((item) => [item.fileId, getDefaultBatchDecisionMode(item)]))
   );
 
   function setAllDecisionModes(mode: BatchDecisionMode) {
@@ -2177,7 +2253,11 @@ function BatchScanConfirmationDialog({
       Object.fromEntries(
         items.map((item) => [
           item.fileId,
-          (item.draft.lineItems?.length ?? 0) > 1 || mode !== "oneTimeSeparate" ? mode : "oneTimeCombined"
+          mode === "discard"
+            ? "discard"
+            : (item.draft.lineItems?.length ?? 0) > 1 || mode !== "oneTimeSeparate"
+              ? mode
+              : "oneTimeCombined"
         ])
       )
     );
@@ -2219,6 +2299,14 @@ function BatchScanConfirmationDialog({
           >
             Positionen einzeln
           </button>
+          <button
+            type="button"
+            onClick={() => setAllDecisionModes("discard")}
+            disabled={scanning}
+            className="inline-flex h-8 items-center rounded-md border border-red-300 bg-red-50 px-3 text-xs font-semibold text-red-800 transition hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Alle verwerfen
+          </button>
         </div>
         <div className="grid max-h-[60vh] gap-4 overflow-y-auto px-4 py-4">
           {items.map((item) => {
@@ -2228,18 +2316,15 @@ function BatchScanConfirmationDialog({
               : invoiceDate.toLocaleDateString("de-AT");
             const lineItems = item.draft.lineItems ?? [];
             const hasLineItemSuggestion = lineItems.length > 1;
+            const tone = getPreviewCardTone(item);
 
             return (
-              <div key={item.fileId} className="rounded-md border border-slate-200">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-3">
+              <div key={item.fileId} className={`rounded-md border ${tone.container}`}>
+                <div className={`flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3 ${tone.header}`}>
                   <div>
                     <div className="text-sm font-semibold text-slate-950">{item.file.name}</div>
-                    <div className="text-xs text-slate-500">
-                      {item.draft.classification === "uncertain"
-                        ? "Modell konnte die Art nicht sicher bestimmen"
-                        : item.draft.classification === "monthly"
-                          ? "Modell vermutet monatliche Ausgabe"
-                          : "Modell vermutet einmalige Ausgabe"}
+                    <div className={`text-xs ${tone.text}`}>
+                      {item.message}
                     </div>
                   </div>
                   <select
@@ -2252,6 +2337,7 @@ function BatchScanConfirmationDialog({
                     }
                     className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-900 outline-none transition focus:border-blue-500"
                   >
+                    <option value="discard">Nicht importieren</option>
                     <option value="monthly">Als monatlich speichern</option>
                     <option value="oneTimeCombined">Als einmalig speichern</option>
                     {hasLineItemSuggestion ? (
@@ -2260,6 +2346,10 @@ function BatchScanConfirmationDialog({
                   </select>
                 </div>
                 <div className="grid gap-2 px-4 py-4 text-sm text-slate-700">
+                  <DraftRow
+                    label="Vorschlag"
+                    value={getPredictedOutcomeLabel(item)}
+                  />
                   <DraftRow label="Anbieter" value={item.draft.vendor || "-"} />
                   <DraftRow label="Leistung" value={item.draft.service || item.draft.description || "-"} />
                   <DraftRow label="Datum" value={formattedDate} />
@@ -2321,7 +2411,7 @@ function BatchScanConfirmationDialog({
               onConfirm(
                 items.map((item) => ({
                   fileId: item.fileId,
-                  ...getBatchDecision(decisionModes[item.fileId] ?? getDefaultBatchDecisionMode(item.draft))
+                  ...getBatchDecision(decisionModes[item.fileId] ?? getDefaultBatchDecisionMode(item))
                 }))
               )
             }

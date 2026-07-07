@@ -8,6 +8,7 @@
 # misc
 .DS_Store
 *.pem
+*.tsbuildinfo
 
 # debug
 npm-debug.log*
@@ -15,6 +16,9 @@ yarn-debug.log*
 yarn-error.log*
 
 # env
+.env
+.env.*
+!.env.example
 .env*.local
 
 # local runtime data

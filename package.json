@@ -2,6 +2,9 @@
   "name": "buchhaltung-overview",
   "version": "0.1.0",
   "private": true,
+  "description": "Local-first expense and invoice management with local AI integration",
+  "author": "Fatih Ayazoglu <fatih.ayazogl@zero2one.at>",
+  "license": "MIT",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
